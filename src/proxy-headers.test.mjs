@@ -99,3 +99,54 @@ test("strips untrusted forwarding headers outside Railway", () => {
 
   assert.deepEqual(Object.fromEntries(proxyReq.headers), {});
 });
+
+test("uses the Tailscale Serve client IP for loopback connections", () => {
+  const proxyReq = proxyRequest({});
+  rebuildForwardedHeaders(
+    proxyReq,
+    {
+      headers: {
+        "x-forwarded-for": "100.86.179.32",
+        "x-forwarded-host": "openclaw.tail0000.ts.net",
+      },
+      socket: { remoteAddress: "127.0.0.1" },
+    },
+    "openclaw.tail0000.ts.net",
+  );
+
+  assert.deepEqual(Object.fromEntries(proxyReq.headers), {
+    "x-forwarded-for": "100.86.179.32",
+    "x-forwarded-proto": "https",
+    "x-forwarded-host": "openclaw.tail0000.ts.net",
+  });
+});
+
+test("ignores X-Forwarded-For from non-loopback peers", () => {
+  const proxyReq = proxyRequest({});
+  rebuildForwardedHeaders(
+    proxyReq,
+    {
+      headers: { "x-forwarded-for": "100.86.179.32" },
+      socket: { remoteAddress: "100.64.0.1" },
+    },
+    "claw.up.railway.app",
+  );
+
+  assert.equal(proxyReq.headers.get("x-forwarded-for"), "127.0.0.1");
+});
+
+test("fails closed on malformed or loopback Tailscale attribution", () => {
+  for (const forwardedFor of [undefined, "not-an-ip", "127.0.0.1", "100.86.179.32, ::1"]) {
+    const proxyReq = proxyRequest({});
+    rebuildForwardedHeaders(
+      proxyReq,
+      {
+        headers: forwardedFor === undefined ? {} : { "x-forwarded-for": forwardedFor },
+        socket: { remoteAddress: "::ffff:127.0.0.1" },
+      },
+      "openclaw.tail0000.ts.net",
+    );
+
+    assert.equal(proxyReq.headers.get("x-forwarded-for"), "127.0.0.1");
+  }
+});
