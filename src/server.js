@@ -25,6 +25,12 @@ const WORKSPACE_DIR =
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+// Hostname browsers use to reach the wrapper: the Tailscale Serve name (set by
+// entrypoint.sh) when running on a tailnet, otherwise the Railway public domain.
+const PUBLIC_HOST =
+  process.env.OPENCLAW_PUBLIC_HOST?.trim() ||
+  process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
+
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
 const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
@@ -228,10 +234,9 @@ function isConfigured() {
 }
 
 async function syncAllowedOrigins() {
-  const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
-  if (!publicDomain) return;
+  if (!PUBLIC_HOST) return;
 
-  const origin = `https://${publicDomain}`;
+  const origin = `https://${PUBLIC_HOST}`;
 
   const current = await runCmd(
     OPENCLAW_NODE,
@@ -519,10 +524,12 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+// Counts failed password attempts only. Every dashboard asset and API call goes
+// through requireSetupAuth, so counting all requests would lock out the owner.
 const setupRateLimiter = {
   attempts: new Map(),
   windowMs: 60_000,
-  maxAttempts: 50,
+  maxAttempts: 10,
   cleanupInterval: setInterval(function () {
     const now = Date.now();
     for (const [ip, data] of setupRateLimiter.attempts) {
@@ -533,16 +540,33 @@ const setupRateLimiter = {
   }, 60_000),
 
   isRateLimited(ip) {
+    const data = this.attempts.get(ip);
+    if (!data || Date.now() - data.windowStart > this.windowMs) return false;
+    return data.count >= this.maxAttempts;
+  },
+
+  recordFailure(ip) {
     const now = Date.now();
     const data = this.attempts.get(ip);
     if (!data || now - data.windowStart > this.windowMs) {
       this.attempts.set(ip, { windowStart: now, count: 1 });
-      return false;
+      return;
     }
     data.count++;
-    return data.count > this.maxAttempts;
   },
 };
+
+// Returns "missing", "invalid", or "ok" for a Basic Authorization header.
+function checkSetupPassword(authorizationHeader) {
+  const [scheme, encoded] = (authorizationHeader || "").split(" ");
+  if (scheme !== "Basic" || !encoded) return "missing";
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  const passwordHash = crypto.createHash("sha256").update(password).digest();
+  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+  return crypto.timingSafeEqual(passwordHash, expectedHash) ? "ok" : "invalid";
+}
 
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
@@ -559,19 +583,13 @@ function requireSetupAuth(req, res, next) {
     return res.status(429).type("text/plain").send("Too many requests. Try again later.");
   }
 
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
+  const result = checkSetupPassword(req.headers.authorization);
+  if (result === "missing") {
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Auth required");
   }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
-  if (!isValid) {
+  if (result === "invalid") {
+    setupRateLimiter.recordFailure(ip);
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Invalid password");
   }
@@ -1761,30 +1779,28 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
-const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
-  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-  : GATEWAY_TARGET;
+const PROXY_ORIGIN = PUBLIC_HOST ? `https://${PUBLIC_HOST}` : GATEWAY_TARGET;
 
 proxy.on("proxyReq", (proxyReq, req, res) => {
   if (!req.url?.startsWith("/hooks/")) {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   }
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
-  rebuildForwardedHeaders(
-    proxyReq,
-    req,
-    process.env.RAILWAY_PUBLIC_DOMAIN,
-  );
+  rebuildForwardedHeaders(proxyReq, req, PUBLIC_HOST);
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
-  rebuildForwardedHeaders(
-    proxyReq,
-    req,
-    process.env.RAILWAY_PUBLIC_DOMAIN,
-  );
+  rebuildForwardedHeaders(proxyReq, req, PUBLIC_HOST);
+});
+
+// The proxy injects the gateway token, so everything it forwards must sit behind
+// SETUP_PASSWORD. /hooks/ is exempt: no token is injected and the gateway
+// authenticates hook callers itself.
+app.use((req, res, next) => {
+  if (req.path === "/" || req.path.startsWith("/hooks/")) return next();
+  return requireSetupAuth(req, res, next);
 });
 
 app.use(async (req, res) => {
@@ -1856,6 +1872,18 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+
+  // Browsers resend the cached Basic credentials on same-origin WebSocket handshakes.
+  const ip = socket.remoteAddress || "unknown";
+  const authResult = SETUP_PASSWORD
+    ? checkSetupPassword(req.headers.authorization)
+    : "missing";
+  if (setupRateLimiter.isRateLimited(ip) || authResult !== "ok") {
+    if (authResult === "invalid") setupRateLimiter.recordFailure(ip);
+    socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+    return;
+  }
+
   try {
     await ensureGatewayRunning();
   } catch (err) {

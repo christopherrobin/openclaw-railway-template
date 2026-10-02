@@ -21,6 +21,9 @@ RUN npm install -g \
   && openclaw --version | grep -Eq '^OpenClaw 2026\.9\.6( |$)'
 RUN npm install -g clawhub@latest
 
+# Tailscale (used only when TS_AUTHKEY is set): serves the UI privately on your tailnet.
+COPY --from=tailscale/tailscale:v1.102.5 /usr/local/bin/tailscaled /usr/local/bin/tailscale /usr/local/bin/
+
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
