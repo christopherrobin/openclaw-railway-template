@@ -31,7 +31,8 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
     sleep 0.25
   done
 
-  if ts up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-openclaw}"; then
+  # Bounded so a bad or expired key can't block the wrapper (and the healthcheck) forever.
+  if ts up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-openclaw}" --timeout=60s; then
     ts serve --bg --https=443 "http://127.0.0.1:${PORT:-8080}" \
       || echo "[tailscale] serve failed: enable HTTPS certificates in the Tailscale admin console (DNS page)"
     OPENCLAW_PUBLIC_HOST="$(ts status --json | node -e '
