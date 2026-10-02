@@ -568,6 +568,33 @@ function checkSetupPassword(authorizationHeader) {
   return crypto.timingSafeEqual(passwordHash, expectedHash) ? "ok" : "invalid";
 }
 
+// Browsers don't attach cached Basic credentials to WebSocket handshakes, so a
+// successful Basic login also sets this cookie. Its value is derived from
+// SETUP_PASSWORD: it can't be forged without it, and rotating the password
+// invalidates every session.
+const SESSION_COOKIE = "openclaw_wrapper_session";
+
+function sessionToken() {
+  return crypto
+    .createHmac("sha256", SETUP_PASSWORD)
+    .update("openclaw-wrapper-session-v1")
+    .digest("base64url");
+}
+
+function hasSessionCookie(cookieHeader) {
+  if (!SETUP_PASSWORD || typeof cookieHeader !== "string") return false;
+  const expected = Buffer.from(sessionToken());
+  for (const part of cookieHeader.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name !== SESSION_COOKIE) continue;
+    const value = Buffer.from(rest.join("="));
+    if (value.length === expected.length && crypto.timingSafeEqual(value, expected)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -585,6 +612,7 @@ function requireSetupAuth(req, res, next) {
 
   const result = checkSetupPassword(req.headers.authorization);
   if (result === "missing") {
+    if (hasSessionCookie(req.headers.cookie)) return next();
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Auth required");
   }
@@ -592,6 +620,14 @@ function requireSetupAuth(req, res, next) {
     setupRateLimiter.recordFailure(ip);
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Invalid password");
+  }
+  if (!hasSessionCookie(req.headers.cookie)) {
+    res.cookie(SESSION_COOKIE, sessionToken(), {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+      path: "/",
+    });
   }
   return next();
 }
@@ -1873,11 +1909,14 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
 
-  // Browsers resend the cached Basic credentials on same-origin WebSocket handshakes.
+  // Browsers send the session cookie (not Basic credentials) on WebSocket handshakes;
+  // Basic is still accepted for non-browser clients.
   const ip = socket.remoteAddress || "unknown";
-  const authResult = SETUP_PASSWORD
-    ? checkSetupPassword(req.headers.authorization)
-    : "missing";
+  const authResult = !SETUP_PASSWORD
+    ? "missing"
+    : hasSessionCookie(req.headers.cookie)
+      ? "ok"
+      : checkSetupPassword(req.headers.authorization);
   if (setupRateLimiter.isRateLimited(ip) || authResult !== "ok") {
     if (authResult === "invalid") setupRateLimiter.recordFailure(ip);
     socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
