@@ -33,8 +33,9 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
 
   # Bounded so a bad or expired key can't block the wrapper (and the healthcheck) forever.
   if ts up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-openclaw}" --timeout=60s; then
-    ts serve --bg --https=443 "http://127.0.0.1:${PORT:-8080}" \
-      || echo "[tailscale] serve failed: enable HTTPS certificates in the Tailscale admin console (DNS page)"
+    # serve blocks until Serve/HTTPS is enabled on the tailnet; don't let it hold up the wrapper.
+    timeout 120 gosu openclaw tailscale --socket="$TS_SOCKET" serve --bg --https=443 "http://127.0.0.1:${PORT:-8080}" \
+      || echo "[tailscale] serve not active: enable Serve and HTTPS certificates for your tailnet, then redeploy"
     OPENCLAW_PUBLIC_HOST="$(ts status --json | node -e '
       let s = "";
       process.stdin.on("data", (d) => (s += d)).on("end", () => {
